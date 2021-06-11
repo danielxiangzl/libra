@@ -32,14 +32,14 @@ pub struct MVHashMap<K, V> {
 
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
 pub(crate) struct WriteVersionValue<V> {
-    flag: AtomicUsize,
+    // flag: AtomicUsize,
     data: OnceCell<Option<V>>,
 }
 
 impl<V> WriteVersionValue<V> {
     pub fn new() -> WriteVersionValue<V> {
         WriteVersionValue {
-            flag: AtomicUsize::new(FLAG_UNASSIGNED),
+            // flag: AtomicUsize::new(FLAG_UNASSIGNED),
             data: OnceCell::new(),
         }
     }
@@ -58,6 +58,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
             map.entry(key)
                 .or_default()
                 .insert(version, WriteVersionValue::new());
+
         }
         (
             map.values()
@@ -92,18 +93,18 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
             .get(&version)
             .ok_or_else(|| ())?;
 
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            let flag = entry.flag.load(Ordering::Acquire);
-            if flag != FLAG_UNASSIGNED {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
+        // #[cfg(test)]
+        // {
+        //     // Test the invariant holds
+        //     let flag = entry.flag.load(Ordering::Acquire);
+        //     if flag != FLAG_UNASSIGNED {
+        //         panic!("Cannot write twice to same entry.");
+        //     }
+        // }
 
         entry.data.set(data).map_err(|_| ())?;
 
-        entry.flag.store(FLAG_DONE, Ordering::Release);
+        // entry.flag.store(FLAG_DONE, Ordering::Release);
         Ok(())
     }
 
@@ -117,10 +118,14 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
             .get(&version)
             .ok_or_else(|| ())?;
 
-        // Test the invariant holds
-        let flag = entry.flag.load(Ordering::Acquire);
-        if flag == FLAG_UNASSIGNED {
-            entry.flag.store(FLAG_SKIP, Ordering::Release);
+        // // Test the invariant holds
+        // let flag = entry.flag.load(Ordering::Acquire);
+        // if flag == FLAG_UNASSIGNED {
+        //     entry.flag.store(FLAG_SKIP, Ordering::Release);
+        // }
+
+        if entry.data.get().is_none() {
+            entry.data.set(None).map_err(|_| ())?;
         }
 
         Ok(())
@@ -136,16 +141,18 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
             .get(&version)
             .ok_or_else(|| ())?;
 
-        #[cfg(test)]
-        {
-            // Test the invariant holds
-            let flag = entry.flag.load(Ordering::Acquire);
-            if flag != FLAG_UNASSIGNED {
-                panic!("Cannot write twice to same entry.");
-            }
-        }
+        // #[cfg(test)]
+        // {
+        //     // Test the invariant holds
+        //     let flag = entry.flag.load(Ordering::Acquire);
+        //     if flag != FLAG_UNASSIGNED {
+        //         panic!("Cannot write twice to same entry.");
+        //     }
+        // }
 
-        entry.flag.store(FLAG_SKIP, Ordering::Release);
+        // entry.flag.store(FLAG_SKIP, Ordering::Release);
+        entry.data.set(None).map_err(|_| ())?;
+
         Ok(())
     }
 
@@ -157,21 +164,36 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 
         while let Some((entry_key, entry_val)) = iter.next_back() {
             if *entry_key < version {
-                let flag = entry_val.flag.load(Ordering::Acquire);
+                // let flag = entry_val.flag.load(Ordering::Acquire);
+
+                let data = entry_val.data.get();
 
                 // Return this key, must wait.
-                if flag == FLAG_UNASSIGNED {
-                    return Err(Some(*entry_key));
-                }
+                // if flag == FLAG_UNASSIGNED {
+                //     return Err(Some(*entry_key));
+                // }
 
-                // If we are to skip this entry, pick the next one
-                if flag == FLAG_SKIP {
-                    continue;
-                }
+                // // If we are to skip this entry, pick the next one
+                // if flag == FLAG_SKIP {
+                //     continue;
+                // }
 
-                // The entry is populated so return its contents
-                if flag == FLAG_DONE {
-                    return Ok(entry_val.data.get().unwrap());
+                // // The entry is populated so return its contents
+                // if flag == FLAG_DONE {
+                //     return Ok(entry_val.data.get().unwrap());
+                // }
+
+                match data {
+                    None => {
+                        return Err(Some(*entry_key));
+                    }
+                    Some(v) => {
+                        if v.is_none() {
+                            continue;
+                        } else {
+                            return Ok(entry_val.data.get().unwrap());
+                        }
+                    }
                 }
 
                 unreachable!();
@@ -221,6 +243,7 @@ where
         (max_dependency_depth, MVHashMap { data })
     }
 }
+
 #[cfg(test)]
 mod tests {
 
