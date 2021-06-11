@@ -1,6 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
 use once_cell::sync::OnceCell;
 use std::{
     cmp::{max, PartialOrd},
@@ -22,48 +23,75 @@ use std::{
 
 pub type Version = usize;
 
-const FLAG_UNASSIGNED: usize = 0;
-const FLAG_DONE: usize = 2;
-const FLAG_SKIP: usize = 3;
+// const FLAG_UNASSIGNED: usize = 0;
+// const FLAG_DONE: usize = 2;
+// const FLAG_SKIP: usize = 3;
 
 pub struct MVHashMap<K, V> {
     data: HashMap<K, BTreeMap<Version, WriteVersionValue<V>>>,
+    shortcut: HashMap<(K, Version), WriteVersionValue<V>>,
 }
+
+// pub struct Shortcut<K, V> {
+//     shortcut: HashMap<(K, Version), WriteVersionValue<V>>,
+// }
 
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
 pub(crate) struct WriteVersionValue<V> {
     // flag: AtomicUsize,
-    data: OnceCell<Option<V>>,
+    data: Arc<OnceCell<Option<V>>>,
 }
 
 impl<V> WriteVersionValue<V> {
     pub fn new() -> WriteVersionValue<V> {
         WriteVersionValue {
             // flag: AtomicUsize::new(FLAG_UNASSIGNED),
-            data: OnceCell::new(),
+            data: Arc::new(OnceCell::new()),
         }
     }
 }
+
+// impl<K, V> Shortcut<K, V>
+// where
+//     K: PartialOrd + Send + Clone + Hash + Eq,
+//     V: Send,
+// {
+//     pub fn new_from_mvhashmap(mvhashmap: &MVHashMap<K, V>) -> Shortcut<K, V> {
+//     let mut shortcut: HashMap<(K, Version), WriteVersionValue<V>> = HashMap::new();
+//         for (key, btree) in mvhashmap.data {
+//             for (version, cell) in &btree {
+//                 shortcut.insert((key, version), WriteVersionValue{ data: Arc::clone(&cell.data) });
+//             }
+//         }
+//         Shortcut{ shortcut }
+//     }
+// }
 
 impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
     pub fn new() -> MVHashMap<K, V> {
         MVHashMap {
             data: HashMap::new(),
+            shortcut: HashMap::new(),
         }
     }
 
     pub fn new_from(possible_writes: Vec<(K, Version)>) -> (usize, MVHashMap<K, V>) {
         let mut map: HashMap<K, BTreeMap<Version, WriteVersionValue<V>>> = HashMap::new();
+        let mut shortcut: HashMap<(K, Version), WriteVersionValue<V>> = HashMap::new();
         for (key, version) in possible_writes.into_iter() {
             map.entry(key)
                 .or_default()
                 .insert(version, WriteVersionValue::new());
-
+        }
+        for (key, btree) in &map {
+            for (version, cell) in btree {
+                shortcut.insert((key.clone(), *version), WriteVersionValue{ data: Arc::clone(&cell.data) });
+            }
         }
         (
             map.values()
                 .fold(0, |max_depth, map| max(max_depth, map.len())),
-            MVHashMap { data: map },
+            MVHashMap { data: map, shortcut },
         )
     }
 
@@ -86,11 +114,16 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
         // So it is safe to go ahead and write without any further check.
         // Then update the flag to enable reads.
 
+        // let entry = self
+        //     .data
+        //     .get(key)
+        //     .ok_or_else(|| ())?
+        //     .get(&version)
+        //     .ok_or_else(|| ())?;
+
         let entry = self
-            .data
-            .get(key)
-            .ok_or_else(|| ())?
-            .get(&version)
+            .shortcut
+            .get(&(key.clone(), version))
             .ok_or_else(|| ())?;
 
         // #[cfg(test)]
@@ -111,11 +144,16 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
     pub fn skip_if_not_set(&self, key: &K, version: Version) -> Result<(), ()> {
         // We only write or skip once per entry
         // So it is safe to go ahead and just do it.
+        // let entry = self
+        //     .data
+        //     .get(key)
+        //     .ok_or_else(|| ())?
+        //     .get(&version)
+        //     .ok_or_else(|| ())?;
+
         let entry = self
-            .data
-            .get(key)
-            .ok_or_else(|| ())?
-            .get(&version)
+            .shortcut
+            .get(&(key.clone(), version))
             .ok_or_else(|| ())?;
 
         // // Test the invariant holds
@@ -134,11 +172,16 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
     pub fn skip(&self, key: &K, version: Version) -> Result<(), ()> {
         // We only write or skip once per entry
         // So it is safe to go ahead and just do it.
+        // let entry = self
+        //     .data
+        //     .get(key)
+        //     .ok_or_else(|| ())?
+        //     .get(&version)
+        //     .ok_or_else(|| ())?;
+
         let entry = self
-            .data
-            .get(key)
-            .ok_or_else(|| ())?
-            .get(&version)
+            .shortcut
+            .get(&(key.clone(), version))
             .ok_or_else(|| ())?;
 
         // #[cfg(test)]
@@ -207,7 +250,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 impl<K, V> MVHashMap<K, V>
 where
     K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Send,
+    V: Send + std::marker::Sync,
 {
     fn split_merge(
         num_cpus: usize,
@@ -240,7 +283,14 @@ where
         let num_cpus = num_cpus::get();
 
         let (max_dependency_depth, data) = Self::split_merge(num_cpus, 0, possible_writes);
-        (max_dependency_depth, MVHashMap { data })
+
+        let mut shortcut: HashMap<(K, Version), WriteVersionValue<V>> = HashMap::new();
+        for (key, btree) in &data {
+            for (version, cell) in btree {
+                shortcut.insert((key.clone(), *version), WriteVersionValue{ data: Arc::clone(&cell.data) });
+            }
+        }
+        (max_dependency_depth, MVHashMap { data, shortcut })
     }
 }
 
