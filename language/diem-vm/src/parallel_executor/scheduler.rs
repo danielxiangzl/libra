@@ -9,6 +9,12 @@ use std::{
 const FLAG_NOT_EXECUTED: usize = 0;
 const FLAG_EXECUTED: usize = 1;
 
+// Data structure (shared among all threads):
+// signature_verified_block[curent_idx]: original transactions in order
+// deps_mapping: hashmap that maps a txn_id to a set of transactions, used for tracking the set of transactions that are scheduled to re-execute once the txn of txn_id is executed
+// txn_id_buffer: list of transactions that are dependency-resolved (optimistically) and scheduled to re-execute
+
+
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
 pub struct DepStruct {
     status: AtomicUsize,                     // true if executed, false otherwise
@@ -26,9 +32,9 @@ impl DepStruct {
 }
 
 pub struct Scheduler {
-    curent_idx: AtomicUsize,        // the shared txn index, A in the doc
-    deps_mapping: Vec<DepStruct>, // the shared mapping from a txn to txns that are dependent on the txn, B in the doc
-    txn_id_buffer: SegQueue<usize>, // the shared ring buffer, B' in the doc
+    curent_idx: AtomicUsize,        // the shared txn index of original transactions in order
+    deps_mapping: Vec<DepStruct>, // the shared mapping from a txn to txns that are dependent on the txn
+    txn_id_buffer: SegQueue<usize>, // the shared queue of list of transactions that are dependency-resolved
     stop_when: AtomicUsize,       // recording number of txns
 }
 
