@@ -13,10 +13,10 @@ use move_core_types::{
     language_storage::{ModuleId, StructTag},
 };
 use move_vm_runtime::data_cache::MoveStorage;
-use mvhashmap::MVHashMap;
-use std::{borrow::Cow, collections::HashSet, convert::AsRef, thread, time::Duration};
+use mvhashmap::{MVHashMap, DynMVHashMap};
+use std::{cmp, borrow::Cow, collections::HashSet, convert::AsRef, thread, time::Duration};
 
-pub struct VersionedDataCache(MVHashMap<AccessPath, Vec<u8>>);
+pub struct VersionedDataCache(MVHashMap<AccessPath, Vec<u8>>, DynMVHashMap<AccessPath, Vec<u8>>);
 
 pub struct VersionedStateView<'view> {
     version: usize,
@@ -29,7 +29,8 @@ const ONE_MILLISEC: Duration = Duration::from_millis(10);
 impl VersionedDataCache {
     pub fn new(write_sequence: Vec<(AccessPath, usize)>) -> (usize, Self) {
         let (max_dependency_length, mv_hashmap) = MVHashMap::new_from_parallel(write_sequence);
-        (max_dependency_length, VersionedDataCache(mv_hashmap))
+        let dyn_mvhashmap = DynMVHashMap::new();
+        (max_dependency_length, VersionedDataCache(mv_hashmap, dyn_mvhashmap))
     }
 
     pub fn set_skip_all(&self, version: usize, estimated_writes: impl Iterator<Item = AccessPath>) {
@@ -41,7 +42,23 @@ impl VersionedDataCache {
         }
     }
 
-    pub fn apply_output(
+    pub fn set_dirty_to_static(&self, version: usize, write_set: HashSet<AccessPath>) {
+        for w in write_set {
+            // It should be safe to unwrap here since the MVMap was construted using
+            // this estimated writes. If not it is a bug.
+            self.0.set_dirty(&w, version).unwrap();
+        }
+    }
+
+    pub fn set_dirty_to_dynamic(&self, version: usize, write_set: HashSet<AccessPath>) {
+        for w in write_set {
+            // It should be safe to unwrap here since the MVMap was dynamic
+            self.1.set_dirty(&w, version).unwrap();
+        }
+    }
+
+    // Apply the writes to static mvhashmap
+    pub fn apply_output_to_static(
         &self,
         output: &TransactionOutput,
         version: usize,
@@ -84,6 +101,122 @@ impl VersionedDataCache {
         }
         Ok(())
     }
+
+    // Apply the writes to dynamic mvhashmap (only for testing)
+    pub fn apply_output_to_dynamic(
+        &self,
+        output: &TransactionOutput,
+        version: usize,
+        _estimated_writes: impl Iterator<Item = AccessPath>,
+    ) -> Result<(), ()> {
+        if !output.status().is_discarded() {
+            for (k, v) in output.write_set() {
+                let val = match v {
+                    WriteOp::Deletion => None,
+                    WriteOp::Value(data) => Some(data.clone()),
+                };
+
+                // Safe because the mvhashmap is dynamic
+                self.1.write(k, version, val).unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    // Apply the writes to both static and dynamic mvhashmap
+    pub fn apply_output_to_both(
+        &self,
+        output: &TransactionOutput,
+        version: usize,
+        estimated_writes: impl Iterator<Item = AccessPath> + Copy,
+    ) -> Result<(), ()> {
+        // First get all non-estimated writes
+        let estimated_writes_hs: HashSet<AccessPath> = estimated_writes.collect();
+        let mut non_estimated_writes_hs: HashSet<AccessPath> = HashSet::new();
+        for (k, _) in output.write_set() {
+            if !estimated_writes_hs.contains(k) {
+                non_estimated_writes_hs.insert(k.clone());
+            }
+        }
+        if !output.status().is_discarded() {
+            for (k, v) in output.write_set() {
+                let val = match v {
+                    WriteOp::Deletion => None,
+                    WriteOp::Value(data) => Some(data.clone()),
+                };
+                // Write estimated writes to static mvhashmap, and write non-estimated ones to dynamic mvhashmap
+                if estimated_writes_hs.contains(k) {
+                    self.0.write(k, version, val).unwrap();
+                } else {
+                    self.1.write(k, version, val).unwrap();
+                }
+            }
+
+            // If any entries are not updated, write a 'skip' flag into them
+            for w in estimated_writes_hs {
+                // It should be safe to unwrap here since the MVMap was construted using
+                // this estimated writes. If not it is a bug.
+                self.as_ref()
+                    .skip_if_not_set(&w, version)
+                    .expect("Entry must exist.");
+            }
+        } else {
+            self.set_skip_all(version, estimated_writes);
+        }
+        Ok(())
+    }
+
+    pub fn read_from_both(&self, access_path: &AccessPath, version: usize) -> Result<(Option<Vec<u8>>, Option<usize>), Option<usize>> {
+        // one access_path may appear in both mvhashmaps, since it maybe estimated for one txn and non-estimated for another txn
+        let static_has_key = self.0.contains_key(access_path);
+        let dyn_has_key = self.1.contains_key(access_path);
+
+        // If both mvhashmaps do not contain AP, return Err(None)
+        if !static_has_key && !dyn_has_key {
+            return Err(None);
+        }
+
+        // If both mvhashmaps contain AP, return the higher version
+        if static_has_key && dyn_has_key {
+            // reads may return Ok((Option<V>, Some<Version>)), Err(Some<Version>) or Err(None)
+            let read_from_static = self.0.read(access_path, version);
+            let read_from_dynamic = self.1.read(access_path, version);
+            // Should return the dependency or data of the higher version
+            let version1 = match read_from_static {
+                Ok((_, version)) => version,
+                Err(version) => version,
+            };
+            let version2 = match read_from_dynamic {
+                Ok((_, version)) => version,
+                Err(version) => version,
+            };
+            if version1.is_some() && version2.is_some() {
+                if version1.unwrap() > version2.unwrap() {
+                    return read_from_static;
+                } else {
+                    return read_from_dynamic;
+                }
+            }
+            if version1.is_none() {
+                return read_from_dynamic;
+            } else {
+                return read_from_static;
+            }
+        } else if static_has_key {
+            // reads may return Ok((Option<V>, Some<Version>)), Err(Some<Version>) or Err(None)
+            return self.0.read(access_path, version);
+        } else {
+            return self.1.read(access_path, version);
+        }
+    }
+
+    pub fn read_from_static(&self, access_path: &AccessPath, version: usize) -> Result<(Option<Vec<u8>>, Option<usize>), Option<usize>> {
+        return self.0.read(access_path, version);
+    }
+
+    pub fn read_from_dynamic(&self, access_path: &AccessPath, version: usize) -> Result<(Option<Vec<u8>>, Option<usize>), Option<usize>> {
+        return self.1.read(access_path, version);
+    }
 }
 
 impl AsRef<MVHashMap<AccessPath, Vec<u8>>> for VersionedDataCache {
@@ -113,9 +246,45 @@ impl<'view> VersionedStateView<'view> {
         return false;
     }
 
-    // Return Some(version) when reading access_path is blcked by transaction of id=version, otherwise return None
-    pub fn will_read_block_return_version(&self, access_path: &AccessPath) -> Option<usize> {
-        let read = self.placeholder.as_ref().read(access_path, self.version);
+    // Return Some(version) when reading access_path is blocked by transaction of id=version, otherwise return None
+    // Only read from static mvhashmap
+    pub fn will_read_from_static_block_return_version(&self, access_path: &AccessPath) -> Option<usize> {
+        let read = self.placeholder.read_from_static(access_path, self.version);
+        if let Err(Some(version)) = read {
+            return Some(version);
+        }
+        return None;
+    }
+
+    // Return Some(version) when reading access_path is blocked by transaction of id=version, otherwise return None
+    // Only read from dynamic mvhashmap (only for testing)
+    pub fn will_read_from_dynamic_block_return_version(&self, access_path: &AccessPath) -> Option<usize> {
+        // First read from the static mvhashmap to get the dependency
+        // Should either return Err(Some(version)) or Err(None)
+        let read_from_static = self.placeholder.read_from_static(access_path, self.version);
+        let dep = match read_from_static {
+            Err(None) => return None,
+            Err(Some(version)) => version,
+            _ => {
+                println!("ERROR!");
+                return None;
+            },
+        };
+        // Then read from the dynamic mvhashmap
+        // If read the right version, return None, otherwise return dependency
+        let read_from_dynamic = self.placeholder.read_from_dynamic(access_path, self.version);
+        if let Ok((_, Some(version))) = read_from_dynamic {
+            if dep == version {
+                return None;
+            }
+        }
+        return Some(dep);
+    }
+
+    // Return Some(version) when reading access_path is blocked by transaction of id=version, otherwise return None
+    // Read from both static and dynamic mvhashmap
+    pub fn will_read_from_both_block_return_version(&self, access_path: &AccessPath) -> Option<usize> {
+        let read = self.placeholder.read_from_both(access_path, self.version);
         if let Err(Some(version)) = read {
             return Some(version);
         }
@@ -125,7 +294,7 @@ impl<'view> VersionedStateView<'view> {
     fn get_bytes_ref(&self, access_path: &AccessPath) -> PartialVMResult<Option<Cow<[u8]>>> {
         let mut loop_iterations = 0;
         loop {
-            let read = self.placeholder.as_ref().read(access_path, self.version);
+            let read = self.placeholder.read_from_dynamic(access_path, self.version);
 
             // Go to the Database
             if let Err(None) = read {
@@ -137,8 +306,8 @@ impl<'view> VersionedStateView<'view> {
             }
 
             // Read is a success
-            if let Ok(data) = read {
-                return Ok(data.as_ref().map(Cow::from));
+            if let Ok((data, _)) = read {
+                return Ok(data.map(Cow::from));
             }
 
             loop_iterations += 1;

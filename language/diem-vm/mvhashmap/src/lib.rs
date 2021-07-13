@@ -7,7 +7,10 @@ use std::{
     collections::{btree_map::BTreeMap, HashMap},
     hash::Hash,
     sync::atomic::{AtomicUsize, Ordering},
+    sync::{Arc, Mutex, RwLock},
 };
+use dashmap::DashMap;
+use arc_swap::ArcSwap;
 
 /// A structure that holds placeholders for each write to the database
 //
@@ -25,22 +28,117 @@ pub type Version = usize;
 const FLAG_UNASSIGNED: usize = 0;
 const FLAG_DONE: usize = 2;
 const FLAG_SKIP: usize = 3;
+const FLAG_DIRTY: usize = 4;
 
 pub struct MVHashMap<K, V> {
     data: HashMap<K, BTreeMap<Version, WriteVersionValue<V>>>,
 }
 
+pub struct DynMVHashMap<K, V> {
+    data: DashMap<K, Arc<RwLock<Vec<(Version, WriteVersionValue<V>)>>>>,
+}
+
 #[cfg_attr(any(target_arch = "x86_64"), repr(align(128)))]
 pub(crate) struct WriteVersionValue<V> {
     flag: AtomicUsize,
-    data: OnceCell<Option<V>>,
+    data: ArcSwap<Option<V>>,
 }
 
 impl<V> WriteVersionValue<V> {
     pub fn new() -> WriteVersionValue<V> {
         WriteVersionValue {
             flag: AtomicUsize::new(FLAG_UNASSIGNED),
-            data: OnceCell::new(),
+            data: ArcSwap::from(Arc::new(None)),
+        }
+    }
+    pub fn new_from(flag: usize, data: Option<V>) -> WriteVersionValue<V> {
+        WriteVersionValue {
+            flag: AtomicUsize::new(flag),
+            data: ArcSwap::from(Arc::new(data)),
+        }
+    }
+}
+
+impl<K: Hash + Clone + Eq, V: Clone> DynMVHashMap<K, V> {
+    pub fn new() -> DynMVHashMap<K, V> {
+        DynMVHashMap {
+            data: DashMap::new(),
+        }
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.data.contains_key(key)
+    }
+
+    pub fn write(&self, key: &K, version: Version, data: Option<V>) -> Result<(), ()> {
+        if !self.data.contains_key(key) {
+            let mut vec = Vec::new();
+            vec.push((version, WriteVersionValue::new_from(FLAG_DONE, data)));
+            self.data.insert(key.clone(), Arc::new(RwLock::new(vec)));
+            return Ok(());
+        } else {
+            let mut temp = self.data.get(key).unwrap();
+            {
+                let mut vec = temp.write().unwrap();
+                if let Some(i) = (0..vec.len()).find(|&i| vec[i].0 == version) {
+                    vec[i].1.flag.store(FLAG_DONE, Ordering::Relaxed);
+                    vec[i].1.data.store(Arc::new(data));
+                } else {
+                    vec.push((version, WriteVersionValue::new_from(FLAG_DONE, data)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_dirty(&self, key: &K, version: Version) -> Result<(), ()> {
+        if !self.data.contains_key(key) {
+            return Ok(());
+        }
+        let mut temp = self.data.get(key).unwrap();
+        let mut vec = temp.write().unwrap();
+        if let Some(i) = (0..vec.len()).find(|&i| vec[i].0 == version) {
+            vec[i].1.flag.store(FLAG_DIRTY, Ordering::Release);
+        } else {
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    // reads may return Ok((Option<V>, Some<Version>)), Err(Some<Version>) or Err(None)
+    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Option<Version>), Option<Version>> {
+        let read_only_view = self.data.clone().into_read_only();
+        if !read_only_view.contains_key(key) {
+            return Err(None);
+        }
+        let tmp = read_only_view.get(key).unwrap();
+        let vec = tmp.read().unwrap();
+
+        // Find the dependency
+        let mut dep_version = None;
+        let mut index = 0;
+        for i in 0..vec.len() {
+            let ver = vec[i].0;
+            if ver < version {
+                if dep_version.is_none() {
+                    dep_version = Some(ver);
+                    index = i
+                } else if dep_version.unwrap() < ver {
+                    dep_version = Some(ver);
+                    index = i
+                }
+            }
+        }
+        if dep_version.is_none() {
+            return Err(None);
+        } else {
+            let dep_version = dep_version.unwrap();
+            let flag = vec[index].1.flag.load(Ordering::Relaxed);
+            if flag == FLAG_DIRTY {
+                return Err(Some(dep_version));
+            }
+            return Ok(((**vec[index].1.data.load()).clone(), Some(dep_version)));
         }
     }
 }
@@ -69,7 +167,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
     pub fn get_change_set(&self) -> Vec<(K, Option<V>)> {
         let mut change_set = Vec::with_capacity(self.data.len());
         for (k, _) in self.data.iter() {
-            let val = self.read(k, usize::MAX).unwrap();
+            let (val, _) = self.read(k, usize::MAX).unwrap();
             change_set.push((k.clone(), val.clone()));
         }
         change_set
@@ -77,6 +175,10 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.data.contains_key(key)
     }
 
     pub fn write(&self, key: &K, version: Version, data: Option<V>) -> Result<(), ()> {
@@ -96,12 +198,12 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
         {
             // Test the invariant holds
             let flag = entry.flag.load(Ordering::Acquire);
-            if flag != FLAG_UNASSIGNED {
+            if flag != FLAG_UNASSIGNED && flag != FLAG_DIRTY {
                 panic!("Cannot write twice to same entry.");
             }
         }
 
-        entry.data.set(data).map_err(|_| ())?;
+        entry.data.store(Arc::new(data));
 
         entry.flag.store(FLAG_DONE, Ordering::Release);
         Ok(())
@@ -119,7 +221,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 
         // Test the invariant holds
         let flag = entry.flag.load(Ordering::Acquire);
-        if flag == FLAG_UNASSIGNED {
+        if flag == FLAG_UNASSIGNED || flag == FLAG_DIRTY {
             entry.flag.store(FLAG_SKIP, Ordering::Release);
         }
 
@@ -140,7 +242,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
         {
             // Test the invariant holds
             let flag = entry.flag.load(Ordering::Acquire);
-            if flag != FLAG_UNASSIGNED {
+            if flag != FLAG_UNASSIGNED && flag != FLAG_DIRTY {
                 panic!("Cannot write twice to same entry.");
             }
         }
@@ -149,7 +251,30 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
         Ok(())
     }
 
-    pub fn read(&self, key: &K, version: Version) -> Result<&Option<V>, Option<Version>> {
+    pub fn set_dirty(&self, key: &K, version: Version) -> Result<(), ()> {
+        // We only write or skip once per entry
+        // So it is safe to go ahead and just do it.
+        let entry = self
+            .data
+            .get(key)
+            .ok_or_else(|| ())?
+            .get(&version)
+            .ok_or_else(|| ())?;
+
+        #[cfg(test)]
+        {
+            // Test the invariant holds
+            let flag = entry.flag.load(Ordering::Acquire);
+            if flag != FLAG_UNASSIGNED && flag != FLAG_DIRTY {
+                panic!("Cannot write twice to same entry.");
+            }
+        }
+
+        entry.flag.store(FLAG_DIRTY, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn read(&self, key: &K, version: Version) -> Result<(Option<V>, Option<Version>), Option<Version>> {
         // Get the smaller key
         let tree = self.data.get(key).ok_or_else(|| None)?;
 
@@ -171,7 +296,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 
                 // The entry is populated so return its contents
                 if flag == FLAG_DONE {
-                    return Ok(entry_val.data.get().unwrap());
+                    return Ok(((**entry_val.data.load()).clone(), Some(*entry_key)));
                 }
 
                 unreachable!();
@@ -185,7 +310,7 @@ impl<K: Hash + Clone + Eq, V: Clone> MVHashMap<K, V> {
 impl<K, V> MVHashMap<K, V>
 where
     K: PartialOrd + Send + Clone + Hash + Eq,
-    V: Send,
+    V: Send + Sync,
 {
     fn split_merge(
         num_cpus: usize,
@@ -259,13 +384,70 @@ mod tests {
 
         // Subsequent higher reads read this entry
         let r1 = mvtbl.read(&ap1, 15);
-        assert_eq!(Ok(&Some(vec![0, 0, 0])), r1);
+        assert_eq!(Ok((Some(vec![0, 0, 0]), Some(10))), r1);
 
         // Set skip works
         assert!(mvtbl.skip(&ap1, 20).is_err());
 
         // Higher reads skip this entry
         let r1 = mvtbl.read(&ap1, 25);
-        assert_eq!(Ok(&Some(vec![0, 0, 0])), r1);
+        assert_eq!(Ok((Some(vec![0, 0, 0]), Some(10))), r1);
+    }
+
+    #[test]
+    fn create_write_read_placeholder_dyn_struct() {
+        let ap1 = b"/foo/b".to_vec();
+        let ap2 = b"/foo/c".to_vec();
+
+        let data = vec![(ap1.clone(), 10), (ap2.clone(), 10), (ap2.clone(), 20), (ap2.clone(), 30)];
+
+        let mvtbl = DynMVHashMap::new();
+
+        // Reads that should go the the DB return Err(None)
+        let r1 = mvtbl.read(&ap1, 10);
+        assert_eq!(Err(None), r1);
+
+        let r1 = mvtbl.read(&ap2, 20);
+        assert_eq!(Err(None), r1);
+
+        // Writes populate the entry
+        mvtbl.write(&ap1, 10, Some(vec![0, 0, 0])).unwrap();
+        mvtbl.write(&ap2, 10, Some(vec![0, 0, 1])).unwrap();
+        mvtbl.write(&ap2, 20, Some(vec![0, 0, 2])).unwrap();
+
+        // Reads the same version should return None
+        let r1 = mvtbl.read(&ap1, 10);
+        assert_eq!(Err(None), r1);
+
+        let r1 = mvtbl.read(&ap2, 10);
+        assert_eq!(Err(None), r1);
+
+        // Subsequent higher reads read this entry
+        let r1 = mvtbl.read(&ap1, 15);
+        assert_eq!(Ok((Some(vec![0, 0, 0]), Some(10))), r1);
+
+        let r1 = mvtbl.read(&ap2, 15);
+        assert_eq!(Ok((Some(vec![0, 0, 1]), Some(10))), r1);
+
+        let r1 = mvtbl.read(&ap2, 25);
+        assert_eq!(Ok((Some(vec![0, 0, 2]), Some(20))), r1);
+
+        // Set dirty
+        assert!(!mvtbl.set_dirty(&ap2, 20).is_err());
+
+        // Higher reads mark this entry as dependency
+        let r1 = mvtbl.read(&ap2, 25);
+        assert_eq!(Err(Some(20)), r1);
+
+        // Write a higher version and reads that
+        mvtbl.write(&ap2, 30, Some(vec![0, 0, 3])).unwrap();
+        let r1 = mvtbl.read(&ap2, 35);
+        assert_eq!(Ok((Some(vec![0, 0, 3]), Some(30))), r1);
+
+        let r1 = mvtbl.read(&ap2, 25);
+        assert_eq!(Err(Some(20)), r1);
+
+        let r1 = mvtbl.read(&ap2, 15);
+        assert_eq!(Ok((Some(vec![0, 0, 1]), Some(10))), r1);
     }
 }

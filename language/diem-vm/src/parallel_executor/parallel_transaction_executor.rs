@@ -25,6 +25,7 @@ use move_core_types::vm_status::VMStatus;
 use num_cpus;
 use rayon::{prelude::*, scope};
 use std::{
+    thread,
     cmp::{max, min},
     collections::VecDeque,
     sync::{
@@ -155,10 +156,12 @@ impl ParallelTransactionExecutor {
                         // If the txn has unresolved dependency, adds the txn to deps_mapping of its dependency (only the first one) and continue
                         if reads.clone().any(|k| {
                             versioned_state_view
-                                .will_read_block_return_version(&k)
+                                .will_read_from_dynamic_block_return_version(&k)
                                 .and_then(|dep_id| scheduler.update_read_deps(idx, dep_id))
                                 .unwrap_or(false)
                         }) {
+                            // println!("Thread {:?} processing txn {} needs re-execution...", thread::current().id(), idx);
+
                             // This causes a PAUSE on an x64 arch, and takes 140 cycles. Allows other
                             // core to take resources and better HT.
                             ::std::sync::atomic::spin_loop_hint();
@@ -172,12 +175,13 @@ impl ParallelTransactionExecutor {
                             &versioned_state_view,
                             &log_context,
                         );
+
                         match res {
                             Ok((vm_status, output, _sender)) => {
                                 scheduler.update_after_execution(idx);
 
                                 if versioned_data_cache
-                                    .apply_output(&output, idx, writes)
+                                    .apply_output_to_dynamic(&output, idx, writes)
                                     .is_err()
                                 {
                                     // An error occured when estimating the write-set of this transaction.
